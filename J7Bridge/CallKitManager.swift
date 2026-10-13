@@ -164,17 +164,17 @@ extension CallKitManager: CXProviderDelegate {
 
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         onLog?("[CALLSHARE_AUDIO_R1] didActivate CALLED")
-        onLog?("[CALLSHARE_AUDIO_R1] session category=\\(audioSession.category.rawValue)")
-        onLog?("[CALLSHARE_AUDIO_R1] session mode=\\(audioSession.mode.rawValue)")
-        onLog?("[CALLSHARE_AUDIO_R1] sampleRate=\\(audioSession.sampleRate)")
-        onLog?("[CALLSHARE_AUDIO_R1] inputChannels=\\(audioSession.inputNumberOfChannels)")
-        onLog?("[CALLSHARE_AUDIO_R1] outputChannels=\\(audioSession.outputNumberOfChannels)")
-        onLog?("[CALLSHARE_AUDIO_R1] ioBuffer=\\(audioSession.ioBufferDuration)")
+        onLog?("[CALLSHARE_AUDIO_R1] session category=\(audioSession.category.rawValue)")
+        onLog?("[CALLSHARE_AUDIO_R1] session mode=\(audioSession.mode.rawValue)")
+        onLog?("[CALLSHARE_AUDIO_R1] sampleRate=\(audioSession.sampleRate)")
+        onLog?("[CALLSHARE_AUDIO_R1] inputChannels=\(audioSession.inputNumberOfChannels)")
+        onLog?("[CALLSHARE_AUDIO_R1] outputChannels=\(audioSession.outputNumberOfChannels)")
+        onLog?("[CALLSHARE_AUDIO_R1] ioBuffer=\(audioSession.ioBufferDuration)")
         let route = audioSession.currentRoute
         let inputs = route.inputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
         let outputs = route.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
-        onLog?("[CALLSHARE_AUDIO_R1] route IN[\\(inputs)] OUT[\\(outputs)]")
-        onLog?("[CALLSHARE_AUDIO_R1] hardwareSampleRate=\\(audioSession.sampleRate)")
+        onLog?("[CALLSHARE_AUDIO_R1] route IN[\(inputs)] OUT[\(outputs)]")
+        onLog?("[CALLSHARE_AUDIO_R1] hardwareSampleRate=\(audioSession.sampleRate)")
         onLog?("[CALLKIT] audio session ACT")
         onAudioActivated?()
     }

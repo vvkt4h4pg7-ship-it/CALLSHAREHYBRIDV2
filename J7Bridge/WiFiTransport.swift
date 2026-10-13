@@ -59,6 +59,7 @@ final class WiFiTransport {
     // R2: use a real UDP datagram socket for RX. This avoids NWConnection peer churn
     // when the Android sender uses an ephemeral UDP source port.
     private var rxSocket: Int32 = -1
+    private var rxReconnectWorkItem: DispatchWorkItem?
     private var rxDatagrams: UInt64 = 0
     private var rxAudioDatagrams: UInt64 = 0
     private var sequence: UInt32 = 0
@@ -101,6 +102,8 @@ final class WiFiTransport {
             self.uplinkReconnectWorkItem = nil
             self.controlReconnectWorkItem?.cancel()
             self.controlReconnectWorkItem = nil
+            self.rxReconnectWorkItem?.cancel()
+            self.rxReconnectWorkItem = nil
             self.uplinkRetryAttempt = 0
             self.controlRetryAttempt = 0
             self.onStatus?("[WIFI] TRANSPORT STOP requested")
@@ -214,6 +217,10 @@ final class WiFiTransport {
     }
 
     private func startListener() {
+        guard rxSocket < 0 else {
+            onStatus?("[WIFI] UDP RX start skipped; socket already open fd=\(rxSocket)")
+            return
+        }
         // R2 intentionally uses a BSD UDP socket for RX instead of NWListener/NWConnection.
         // NWConnection can create/tear down peer objects as the Android sender changes
         // its ephemeral source port. A bound datagram socket receives every UDP packet
@@ -267,9 +274,27 @@ final class WiFiTransport {
             }
 
             if count < 0 {
-                if errno == EINTR { continue }
+                let socketError = errno
+                if socketError == EINTR { continue }
                 if rxSocket == fd {
-                    onStatus?("[WIFI] UDP RX ERROR errno=\(errno)")
+                    onStatus?("[WIFI] UDP RX ERROR errno=\(socketError); scheduling socket recovery")
+                    // A terminal recvfrom error used to kill this receive loop forever
+                    // while leaving rxSocket set to the dead descriptor. The transport's
+                    // started flag then prevented start() from binding a replacement.
+                    txQueue.async { [weak self] in
+                        guard let self, self.started, self.rxSocket == fd else { return }
+                        self.rxSocket = -1
+                        _ = shutdown(fd, SHUT_RDWR)
+                        _ = close(fd)
+                        self.rxReconnectWorkItem?.cancel()
+                        let work = DispatchWorkItem { [weak self] in
+                            guard let self, self.started, self.rxSocket < 0 else { return }
+                            self.onStatus?("[WIFI] UDP RX RECOVERY retry bind port=\(self.port)")
+                            self.startListener()
+                        }
+                        self.rxReconnectWorkItem = work
+                        self.txQueue.asyncAfter(deadline: .now() + 1.0, execute: work)
+                    }
                 }
                 return
             }
