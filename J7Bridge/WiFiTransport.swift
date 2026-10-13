@@ -36,6 +36,15 @@ final class WiFiTransport {
     private var rxFragmentOrder: [UInt32] = []
     private var txAudioFrames: UInt64 = 0
 
+    // R1 loss concealment state. All fields below are touched only by the
+    // serial blocking RX loop (receiveDatagrams -> handleDatagram -> parseAudioDatagram).
+    private var lastDeliveredAudioSequence: UInt32?
+    private var lastDeliveredAudioPCM: Data?
+    private var lastDeliveredWasConcealment = false
+    private var concealedAudioFrames: UInt64 = 0
+    private var droppedLateAudioFrames: UInt64 = 0
+    private var observedAudioGapFrames: UInt64 = 0
+
     private var _j7Host: String
     let port: UInt16
 
@@ -59,13 +68,12 @@ final class WiFiTransport {
     // R2: use a real UDP datagram socket for RX. This avoids NWConnection peer churn
     // when the Android sender uses an ephemeral UDP source port.
     private var rxSocket: Int32 = -1
-    private var rxReconnectWorkItem: DispatchWorkItem?
     private var rxDatagrams: UInt64 = 0
     private var rxAudioDatagrams: UInt64 = 0
     private var sequence: UInt32 = 0
     private var pendingTX: [Data] = []
     private var pendingControlTX: [Data] = []
-    private let maxPendingTX = 5
+    private let maxPendingTX = 15 // 5 complete R2 audio frames at 3 UDP datagrams per frame
 
     // R1 background resilience: recover terminal UDP uplink failures instead of
     // leaving the audio/control path nil until the user edits the J7 address.
@@ -90,7 +98,7 @@ final class WiFiTransport {
             self.started = true
             self.startListener()
             self.startUplink()
-            self.onStatus?("[HYBRID R1] BLE owns call signaling; Wi-Fi starts audio transport only")
+            self.startControlUplink()
         }
     }
 
@@ -102,8 +110,6 @@ final class WiFiTransport {
             self.uplinkReconnectWorkItem = nil
             self.controlReconnectWorkItem?.cancel()
             self.controlReconnectWorkItem = nil
-            self.rxReconnectWorkItem?.cancel()
-            self.rxReconnectWorkItem = nil
             self.uplinkRetryAttempt = 0
             self.controlRetryAttempt = 0
             self.onStatus?("[WIFI] TRANSPORT STOP requested")
@@ -148,7 +154,8 @@ final class WiFiTransport {
             self.controlUplink = nil
             if self.started {
                 self.startUplink()
-                }
+                self.startControlUplink()
+            }
             self.onStatus?("[WIFI] J7 HOST = \(cleaned)")
         }
     }
@@ -217,10 +224,6 @@ final class WiFiTransport {
     }
 
     private func startListener() {
-        guard rxSocket < 0 else {
-            onStatus?("[WIFI] UDP RX start skipped; socket already open fd=\(rxSocket)")
-            return
-        }
         // R2 intentionally uses a BSD UDP socket for RX instead of NWListener/NWConnection.
         // NWConnection can create/tear down peer objects as the Android sender changes
         // its ephemeral source port. A bound datagram socket receives every UDP packet
@@ -274,27 +277,9 @@ final class WiFiTransport {
             }
 
             if count < 0 {
-                let socketError = errno
-                if socketError == EINTR { continue }
+                if errno == EINTR { continue }
                 if rxSocket == fd {
-                    onStatus?("[WIFI] UDP RX ERROR errno=\(socketError); scheduling socket recovery")
-                    // A terminal recvfrom error used to kill this receive loop forever
-                    // while leaving rxSocket set to the dead descriptor. The transport's
-                    // started flag then prevented start() from binding a replacement.
-                    txQueue.async { [weak self] in
-                        guard let self, self.started, self.rxSocket == fd else { return }
-                        self.rxSocket = -1
-                        _ = shutdown(fd, SHUT_RDWR)
-                        _ = close(fd)
-                        self.rxReconnectWorkItem?.cancel()
-                        let work = DispatchWorkItem { [weak self] in
-                            guard let self, self.started, self.rxSocket < 0 else { return }
-                            self.onStatus?("[WIFI] UDP RX RECOVERY retry bind port=\(self.port)")
-                            self.startListener()
-                        }
-                        self.rxReconnectWorkItem = work
-                        self.txQueue.asyncAfter(deadline: .now() + 1.0, execute: work)
-                    }
+                    onStatus?("[WIFI] UDP RX ERROR errno=\(errno)")
                 }
                 return
             }
@@ -391,6 +376,7 @@ final class WiFiTransport {
             self.controlUplink?.cancel()
             self.controlUplink = nil
             self.startUplink()
+            self.startControlUplink()
             self.onStatus?("[WIFI AUTO] J7 IP DISCOVERED \(oldHost) -> \(host) via \(reason)")
             self.onJ7HostDiscovered?(host)
         }
@@ -417,6 +403,7 @@ final class WiFiTransport {
                 self.uplinkReconnectWorkItem = nil
                 self.uplinkRetryAttempt = 0
                 self.flushPendingTX()
+                self.sendHello()
             case .failed(let error):
                 self.onStatus?("[WIFI] J7 UPLINK FAILED host=\(targetHost) error=\(error.localizedDescription)")
                 // Only clear/recover the connection if this is still the current uplink.
@@ -520,6 +507,7 @@ final class WiFiTransport {
             self.controlReconnectWorkItem = nil
             guard self.started, self.controlUplink == nil else { return }
             self.onStatus?("[WIFI] CONTROL RECONNECT NOW attempt=\(attempt)")
+            self.startControlUplink()
         }
         controlReconnectWorkItem = work
         txQueue.asyncAfter(deadline: .now() + delay, execute: work)
@@ -646,7 +634,8 @@ final class WiFiTransport {
             if rxAudioDatagrams <= 9 {
                 onStatus?("[WIFI_R2] RX REASSEMBLED seq=\(sequence) fragments=3 datagrams=1300B pcm=\(assembled.count)B")
             }
-            onAudioPCM?(assembled, sampleRate, channels, 960)
+            deliverAudioFrame(sequence: sequence, pcm: assembled,
+                              sampleRate: sampleRate, channels: channels, frames: 960)
             return
         }
 
@@ -658,7 +647,143 @@ final class WiFiTransport {
         if rxAudioDatagrams <= 3 {
             onStatus?("[WIFI_AUDIO] RX VALID legacy J7WV rate=\(sampleRate) ch=\(channels) frames=\(frames) pcm=\(payload.count)B")
         }
-        onAudioPCM?(payload, sampleRate, channels, frames)
+        deliverAudioFrame(sequence: sequence, pcm: payload,
+                          sampleRate: sampleRate, channels: channels, frames: frames)
+    }
+
+    /// Deliver audio in sequence order without adding a jitter-buffer delay.
+    /// If one or two full 20 ms frames are missing (often because one of the
+    /// three UDP fragments was lost), insert a short fade-to-silence frame so
+    /// the player does not splice two unrelated waveform edges together.
+    private func deliverAudioFrame(sequence currentSequence: UInt32, pcm: Data,
+                                   sampleRate: UInt32, channels: UInt16, frames: UInt16) {
+        if let lastSequence = lastDeliveredAudioSequence {
+            let delta = currentSequence &- lastSequence
+
+            if delta == 0 {
+                droppedLateAudioFrames &+= 1
+                if droppedLateAudioFrames == 1 || droppedLateAudioFrames % 25 == 0 {
+                    onStatus?("[WIFI_AUDIO] DUPLICATE FRAME DROP seq=\(currentSequence) total=\(droppedLateAudioFrames)")
+                }
+                return
+            }
+
+            if delta >= 0x8000_0000 {
+                let signedDelta = Int32(bitPattern: delta)
+                // A large backwards jump indicates the native Core restarted its
+                // sequence counter. A small backwards jump is a late/reordered UDP frame.
+                if signedDelta < -32 {
+                    onStatus?("[WIFI_AUDIO] SEQUENCE RESET old=\(lastSequence) new=\(currentSequence); re-synchronizing")
+                    lastDeliveredAudioSequence = nil
+                    lastDeliveredAudioPCM = nil
+                    lastDeliveredWasConcealment = false
+                } else {
+                    droppedLateAudioFrames &+= 1
+                    if droppedLateAudioFrames == 1 || droppedLateAudioFrames % 25 == 0 {
+                        onStatus?("[WIFI_AUDIO] LATE/REORDER FRAME DROP seq=\(currentSequence) last=\(lastSequence) total=\(droppedLateAudioFrames)")
+                    }
+                    return
+                }
+            } else if delta > 1 {
+                let missing = delta - 1
+                observedAudioGapFrames &+= missing
+                onStatus?("[WIFI_AUDIO] SEQUENCE GAP last=\(lastSequence) next=\(currentSequence) missing=\(missing) totalMissing=\(observedAudioGapFrames)")
+
+                if missing <= 2 {
+                    for _ in 0..<Int(missing) {
+                        let concealment = makeConcealmentFrame(from: lastDeliveredAudioPCM)
+                        let concealedSequence = (lastDeliveredAudioSequence ?? lastSequence) &+ 1
+                        onAudioPCM?(concealment, sampleRate, channels, frames)
+                        lastDeliveredAudioSequence = concealedSequence
+                        lastDeliveredAudioPCM = concealment
+                        lastDeliveredWasConcealment = true
+                        concealedAudioFrames &+= 1
+                    }
+                    if concealedAudioFrames == 1 || concealedAudioFrames % 10 == 0 {
+                        onStatus?("[WIFI_AUDIO] PLC INSERTED frames=\(missing) total=\(concealedAudioFrames)")
+                    }
+                } else {
+                    // Do not manufacture a long backlog after a major network/Core
+                    // pause. Jump to the live edge, then gently fade the first real frame in.
+                    lastDeliveredAudioSequence = currentSequence &- 1
+                    lastDeliveredAudioPCM = nil
+                    lastDeliveredWasConcealment = true
+                    onStatus?("[WIFI_AUDIO] LARGE GAP=\(missing); resync live edge without added delay")
+                }
+            }
+        }
+
+        let outputPCM = lastDeliveredWasConcealment ? fadeInFrame(pcm, rampFrames: 96) : pcm
+        onAudioPCM?(outputPCM, sampleRate, channels, frames)
+        lastDeliveredAudioSequence = currentSequence
+        lastDeliveredAudioPCM = outputPCM
+        lastDeliveredWasConcealment = false
+    }
+
+    /// Build one 20 ms concealment frame. It starts at the previous frame's last
+    /// L/R sample and ramps that sample to zero, avoiding an abrupt PCM amplitude edge.
+    private func makeConcealmentFrame(from previousPCM: Data?) -> Data {
+        let frameCount = Self.fullPCMBytes / 4 // 960 stereo S16 frames
+        guard let previousPCM, previousPCM.count == Self.fullPCMBytes else {
+            return Data(repeating: 0, count: Self.fullPCMBytes)
+        }
+
+        var output = Data(count: Self.fullPCMBytes)
+        output.withUnsafeMutableBytes { outputRaw in
+            previousPCM.withUnsafeBytes { previousRaw in
+                let dst = outputRaw.bindMemory(to: UInt8.self)
+                let src = previousRaw.bindMemory(to: UInt8.self)
+                guard dst.count >= Self.fullPCMBytes, src.count >= Self.fullPCMBytes else { return }
+
+                let leftOffset = Self.fullPCMBytes - 4
+                let rightOffset = Self.fullPCMBytes - 2
+                let leftBits = UInt16(src[leftOffset]) | (UInt16(src[leftOffset + 1]) << 8)
+                let rightBits = UInt16(src[rightOffset]) | (UInt16(src[rightOffset + 1]) << 8)
+                let leftLast = Int16(bitPattern: leftBits)
+                let rightLast = Int16(bitPattern: rightBits)
+
+                for frame in 0..<frameCount {
+                    let gain = 1.0 - (Double(frame) / Double(max(frameCount - 1, 1)))
+                    let left = Int16((Double(leftLast) * gain).rounded())
+                    let right = Int16((Double(rightLast) * gain).rounded())
+                    let leftWord = UInt16(bitPattern: left)
+                    let rightWord = UInt16(bitPattern: right)
+                    let offset = frame * 4
+                    dst[offset] = UInt8(truncatingIfNeeded: leftWord)
+                    dst[offset + 1] = UInt8(truncatingIfNeeded: leftWord >> 8)
+                    dst[offset + 2] = UInt8(truncatingIfNeeded: rightWord)
+                    dst[offset + 3] = UInt8(truncatingIfNeeded: rightWord >> 8)
+                }
+            }
+        }
+        return output
+    }
+
+    /// When real audio resumes after concealment, fade its first 2 ms in to avoid a click.
+    private func fadeInFrame(_ pcm: Data, rampFrames: Int) -> Data {
+        guard pcm.count == Self.fullPCMBytes, rampFrames > 1 else { return pcm }
+        var output = pcm
+        let byteCount = output.count
+        let rampCount = min(rampFrames, byteCount / 4)
+        output.withUnsafeMutableBytes { raw in
+            let bytes = raw.bindMemory(to: UInt8.self)
+            guard bytes.count >= byteCount else { return }
+            for frame in 0..<rampCount {
+                let gain = Double(frame) / Double(max(rampCount - 1, 1))
+                let offset = frame * 4
+                let leftBits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+                let rightBits = UInt16(bytes[offset + 2]) | (UInt16(bytes[offset + 3]) << 8)
+                let left = Int16((Double(Int16(bitPattern: leftBits)) * gain).rounded())
+                let right = Int16((Double(Int16(bitPattern: rightBits)) * gain).rounded())
+                let leftWord = UInt16(bitPattern: left)
+                let rightWord = UInt16(bitPattern: right)
+                bytes[offset] = UInt8(truncatingIfNeeded: leftWord)
+                bytes[offset + 1] = UInt8(truncatingIfNeeded: leftWord >> 8)
+                bytes[offset + 2] = UInt8(truncatingIfNeeded: rightWord)
+                bytes[offset + 3] = UInt8(truncatingIfNeeded: rightWord >> 8)
+            }
+        }
+        return output
     }
 
     private func sendControl(_ control: Control, payload: Data) {
