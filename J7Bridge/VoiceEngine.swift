@@ -149,12 +149,8 @@ final class VoiceEngine: NSObject {
             NSLog("[J7BRIDGE_DIAG] VoiceEngine OPEN OK")
 
             reportStatus(
-                String(
-                    format: "OPEN OK / mic %.0f Hz %dch -> AMR-NB 8k / speaker=%@",
-                    hardwareFormat.sampleRate,
-                    hardwareFormat.channelCount,
-                    useSpeaker ? "YES" : "NO"
-                )
+                "OPEN OK / mic \(Int(hardwareFormat.sampleRate)) Hz \(hardwareFormat.channelCount)ch " +
+                "-> AMR-NB 8k / \(routeDescription())"
             )
         } catch {
             isRunning = false
@@ -240,17 +236,13 @@ final class VoiceEngine: NSObject {
     private func applySessionCategory() {
         // Match the active Wi-Fi engine: keep standard iPhone/CallKit routing
         // instead of forcing the built-in speaker as the default output.
-        let options: AVAudioSession.CategoryOptions
-        if #available(iOS 17.0, *) {
-            options = [.allowBluetoothHFP]
-        } else {
-            options = [.allowBluetooth]
-        }
-
+        // Do not force .defaultToSpeaker. Keep the standard CallKit route
+        // selection (receiver/speaker) available, while allowing HFP accessories.
+        // .allowBluetooth is supported by the project's Xcode 16.4 SDK.
         try? audioSession.setCategory(
             .playAndRecord,
             mode: .voiceChat,
-            options: options
+            options: [.allowBluetooth]
         )
     }
 

@@ -133,18 +133,11 @@ final class WiFiVoiceEngine: NSObject {
     // MARK: - Session / engine setup
 
     private func configureAudioSession() {
-        // Do not set .defaultToSpeaker: Apple documents that this option can
-        // ignore user route gestures. Let CallKit's native audio route control
-        // switch between the receiver, built-in speaker, and HFP accessories.
-        let options: AVAudioSession.CategoryOptions
-        if #available(iOS 17.0, *) {
-            options = [.allowBluetoothHFP]
-        } else {
-            options = [.allowBluetooth]
-        }
-
+        // Let CallKit/system route controls select receiver or speaker.
+        // Do not force .defaultToSpeaker; allow Bluetooth HFP accessories.
+        // .allowBluetooth is supported by the project's Xcode 16.4 SDK.
         do {
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
+            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
             try audioSession.setPreferredSampleRate(Self.sampleRate)
             // Request a low-latency hardware I/O cycle. The wire packet remains 20 ms.
             try audioSession.setPreferredIOBufferDuration(0.01)
