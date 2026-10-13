@@ -23,8 +23,15 @@ final class WiFiVoiceEngine: NSObject {
     private let audioSession = AVAudioSession.sharedInstance()
     private let playerNode = AVAudioPlayerNode()
     private let transport: WiFiTransport
-    private let playbackQueue = DispatchQueue(label: "com.callshare.wifi.playback.r1", qos: .userInitiated)
+    private let playbackQueue = DispatchQueue(label: "com.callshare.wifi.playback.r2", qos: .userInitiated)
+    private let playbackQueueKey = DispatchSpecificKey<UInt8>()
     private let stateLock = NSLock()
+
+    // J7WV frames are 20 ms. Cap scheduled audio at four frames (80 ms) so
+    // transient render/network stalls cannot turn into seconds of stale audio.
+    private let maximumQueuedPlaybackFrames = 4
+    private var pendingPlaybackBuffers = 0
+    private var playbackEpoch: UInt64 = 0
 
     private var isRunning = false
     private var muted = false
@@ -69,28 +76,129 @@ final class WiFiVoiceEngine: NSObject {
     var onStatus: ((String) -> Void)?
 
     private var routeChangeObserver: NSObjectProtocol?
+    private var engineConfigurationObserver: NSObjectProtocol?
+    private var interruptionObserver: NSObjectProtocol?
+    private var routeRecoveryWorkItem: DispatchWorkItem?
+    private var pendingRecoveryReasons: [String] = []
+    private var pendingRecoveryMustRun = false
+    private var lastEngineRecoveryUptime: TimeInterval = 0
+    private var engineStartedUptime: TimeInterval = 0
 
     init(transport: WiFiTransport) {
         self.transport = transport
         super.init()
-        routeChangeObserver = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.routeChangeNotification,
-            object: audioSession,
-            queue: .main
-        ) { [weak self] notification in
-            guard let self else { return }
-            let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
-            let outputs = self.audioSession.currentRoute.outputs
-                .map { "\($0.portType.rawValue):\($0.portName)" }
-                .joined(separator: ",")
-            self.report("[WIFI_AUDIO] ROUTE_CHANGE reason=\(rawReason) OUT=[\(outputs)] engineRunning=\(self.audioEngine.isRunning) voiceRunning=\(self.runningSnapshot())")
-        }
+        playbackQueue.setSpecific(key: playbackQueueKey, value: 1)
+        installAudioChangeObservers()
     }
 
     deinit {
-        if let routeChangeObserver {
-            NotificationCenter.default.removeObserver(routeChangeObserver)
+        routeRecoveryWorkItem?.cancel()
+        for observer in [routeChangeObserver, engineConfigurationObserver, interruptionObserver].compactMap({ $0 }) {
+            NotificationCenter.default.removeObserver(observer)
         }
+    }
+
+    private func syncOnPlaybackQueue<T>(_ work: () -> T) -> T {
+        if DispatchQueue.getSpecific(key: playbackQueueKey) != nil {
+            return work()
+        }
+        return playbackQueue.sync(execute: work)
+    }
+
+    private func installAudioChangeObservers() {
+        let center = NotificationCenter.default
+        routeChangeObserver = center.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: audioSession,
+            queue: nil
+        ) { [weak self] notification in
+            let rawReason = (notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).map { String($0) } ?? "unknown"
+            self?.scheduleEngineRecovery(reason: "route-change-\(rawReason)", delay: 0.16, mustRun: true)
+        }
+
+        engineConfigurationObserver = center.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: audioEngine,
+            queue: nil
+        ) { [weak self] _ in
+            self?.scheduleEngineRecovery(reason: "engine-configuration-change", delay: 0.18, mustRun: false)
+        }
+
+        interruptionObserver = center.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: audioSession,
+            queue: nil
+        ) { [weak self] notification in
+            guard let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let interruptionType = AVAudioSession.InterruptionType(rawValue: rawType),
+                  interruptionType == .ended else { return }
+            self?.scheduleEngineRecovery(reason: "session-interruption-ended", delay: 0.20, mustRun: true)
+        }
+    }
+
+    private func scheduleEngineRecovery(reason: String, delay: TimeInterval, mustRun: Bool) {
+        playbackQueue.async { [weak self] in
+            guard let self, self.runningSnapshot() else { return }
+            self.pendingRecoveryReasons.append(reason)
+            self.pendingRecoveryMustRun = self.pendingRecoveryMustRun || mustRun
+            self.routeRecoveryWorkItem?.cancel()
+
+            let workItem = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                let reasons = self.pendingRecoveryReasons
+                let forceRecovery = self.pendingRecoveryMustRun
+                self.pendingRecoveryReasons.removeAll(keepingCapacity: true)
+                self.pendingRecoveryMustRun = false
+                self.routeRecoveryWorkItem = nil
+                guard self.runningSnapshot() else { return }
+
+                let now = ProcessInfo.processInfo.systemUptime
+                // Ignore configuration notices caused by initial graph creation.
+                if !forceRecovery && now - self.engineStartedUptime < 0.80 {
+                    self.report("[WIFI_AUDIO] ROUTE_RECOVERY startup graph change ignored")
+                    return
+                }
+                // A forced route change must always recover, even if the user
+                // toggles speaker/receiver twice quickly. Only coalesce graph-only notices.
+                if !forceRecovery && self.lastEngineRecoveryUptime > 0 && now - self.lastEngineRecoveryUptime < 0.50 {
+                    self.report("[WIFI_AUDIO] ROUTE_RECOVERY duplicate graph event coalesced")
+                    return
+                }
+                self.lastEngineRecoveryUptime = now
+                self.recoverAudioEngine(reason: reasons.joined(separator: ","))
+            }
+            self.routeRecoveryWorkItem = workItem
+            self.playbackQueue.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
+    }
+
+    private func recoverAudioEngine(reason: String) {
+        guard runningSnapshot() else { return }
+        report("[WIFI_AUDIO] ROUTE_RECOVERY BEGIN reason=\(reason) route=\(currentOutputRouteDescription())")
+
+        stateLock.lock()
+        isRunning = false
+        stateLock.unlock()
+
+        audioEngine.inputNode.removeTap(onBus: 0)
+        playerNode.stop()
+        playerNode.reset()
+        playbackEpoch &+= 1
+        pendingPlaybackBuffers = 0
+        audioEngine.stop()
+        micConverter = nil
+        micInputFormat = nil
+        monoAccumulator.removeAll(keepingCapacity: true)
+
+        if startEngine() {
+            report("[WIFI_AUDIO] ROUTE_RECOVERY OK route=\(currentOutputRouteDescription())")
+        } else {
+            report("[WIFI_AUDIO] ROUTE_RECOVERY FAILED reason=\(reason)")
+        }
+    }
+
+    private func currentOutputRouteDescription() -> String {
+        audioSession.currentRoute.outputs.map { "\($0.portType.rawValue):\($0.portName)" }.joined(separator: ",")
     }
 
     // MARK: - Public API (kept compatible with AppModel.swift)
@@ -105,34 +213,42 @@ final class WiFiVoiceEngine: NSObject {
     /// Called before CallKit activates its audio session. Never activates the
     /// session itself; CXProviderDelegate.didActivate remains authoritative.
     func prepareForCallAudio() {
-        configureAudioSession()
-        report("[WIFI_AUDIO] FRESH_R1 SESSION PREPARED; CallKit owns activation")
+        syncOnPlaybackQueue { configureAudioSession() }
+        report("[WIFI_AUDIO] R2 SESSION PREPARED; CallKit owns activation")
     }
 
     @discardableResult
     func start() -> Bool {
-        startEngine()
+        syncOnPlaybackQueue { startEngine() }
     }
 
     func stop() {
-        stateLock.lock()
-        let wasRunning = isRunning
-        isRunning = false
-        stateLock.unlock()
+        syncOnPlaybackQueue {
+            stateLock.lock()
+            let wasRunning = isRunning
+            isRunning = false
+            stateLock.unlock()
 
-        guard wasRunning || audioEngine.isRunning else { return }
+            routeRecoveryWorkItem?.cancel()
+            routeRecoveryWorkItem = nil
+            pendingRecoveryReasons.removeAll(keepingCapacity: true)
+            pendingRecoveryMustRun = false
+            guard wasRunning || audioEngine.isRunning else { return }
 
-        audioEngine.inputNode.removeTap(onBus: 0)
-        playerNode.stop()
-        playerNode.reset()
-        audioEngine.stop()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            playerNode.stop()
+            playerNode.reset()
+            playbackEpoch &+= 1
+            pendingPlaybackBuffers = 0
+            audioEngine.stop()
 
-        micConverter = nil
-        micInputFormat = nil
-        monoAccumulator.removeAll(keepingCapacity: true)
-        resetMicDSP()
-        // Call signaling/voice-open-close is owned by BLE GATT in HYBRID R1.
-        report("[WIFI_AUDIO] FRESH_R1 CLOSED")
+            micConverter = nil
+            micInputFormat = nil
+            monoAccumulator.removeAll(keepingCapacity: true)
+            resetMicDSP()
+            // Call signaling/voice-open-close is owned by BLE GATT in HYBRID R1.
+            report("[WIFI_AUDIO] R2 CLOSED")
+        }
     }
 
     func receivePCM(_ pcm: Data, sampleRate: UInt32, channels: UInt16, frames: UInt16) {
@@ -235,6 +351,8 @@ final class WiFiVoiceEngine: NSObject {
             stateLock.lock()
             isRunning = true
             stateLock.unlock()
+            engineStartedUptime = ProcessInfo.processInfo.systemUptime
+            pendingPlaybackBuffers = 0
 
             playerNode.play()
             // Voice-open signaling is owned by BLE GATT in HYBRID R1.
@@ -416,7 +534,8 @@ final class WiFiVoiceEngine: NSObject {
     // MARK: - J7 -> iPhone playback (wire-compatible path kept intentionally simple)
 
     private func playPCMNow(_ pcm: Data) {
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: wireFormat, frameCapacity: AVAudioFrameCount(Self.packetFrames)) else { return }
+        guard audioEngine.isRunning,
+              let buffer = AVAudioPCMBuffer(pcmFormat: wireFormat, frameCapacity: AVAudioFrameCount(Self.packetFrames)) else { return }
         buffer.frameLength = AVAudioFrameCount(Self.packetFrames)
 
         let audioBufferList = buffer.mutableAudioBufferList
@@ -428,10 +547,30 @@ final class WiFiVoiceEngine: NSObject {
             memcpy(destination, base, pcm.count)
         }
 
-        playerNode.scheduleBuffer(buffer)
+        // Keep conversational latency bounded. If rendering falls behind, flush
+        // queued stale frames and schedule this newest frame instead of building delay.
+        if pendingPlaybackBuffers >= maximumQueuedPlaybackFrames {
+            report("[WIFI_AUDIO] PLAYBACK QUEUE FLUSH pending=\(pendingPlaybackBuffers) max=\(maximumQueuedPlaybackFrames)")
+            playerNode.stop()
+            playerNode.reset()
+            playbackEpoch &+= 1
+            pendingPlaybackBuffers = 0
+        }
+
+        pendingPlaybackBuffers += 1
+        let scheduledEpoch = playbackEpoch
+        playerNode.scheduleBuffer(buffer, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+            guard let self else { return }
+            self.playbackQueue.async {
+                // Completions for buffers flushed during a route change must not
+                // decrement the queue count for newly scheduled audio.
+                guard scheduledEpoch == self.playbackEpoch else { return }
+                self.pendingPlaybackBuffers = max(0, self.pendingPlaybackBuffers - 1)
+            }
+        }
         rxFrames += 1
         if rxFrames == 1 || rxFrames % 50 == 0 {
-            report("[WIFI_AUDIO] FRESH_R1 RX PCM #\(rxFrames) 3840B")
+            report("[WIFI_AUDIO] R2 RX PCM #\(rxFrames) 3840B pending=\(pendingPlaybackBuffers)")
         }
         if !playerNode.isPlaying { playerNode.play() }
     }
