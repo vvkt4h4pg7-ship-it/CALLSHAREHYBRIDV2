@@ -686,7 +686,7 @@ final class WiFiTransport {
                 }
             } else if delta > 1 {
                 let missing = delta - 1
-                observedAudioGapFrames &+= missing
+                observedAudioGapFrames &+= UInt64(missing)
                 onStatus?("[WIFI_AUDIO] SEQUENCE GAP last=\(lastSequence) next=\(currentSequence) missing=\(missing) totalMissing=\(observedAudioGapFrames)")
 
                 if missing <= 2 {
