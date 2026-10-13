@@ -68,9 +68,29 @@ final class WiFiVoiceEngine: NSObject {
 
     var onStatus: ((String) -> Void)?
 
+    private var routeChangeObserver: NSObjectProtocol?
+
     init(transport: WiFiTransport) {
         self.transport = transport
         super.init()
+        routeChangeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: audioSession,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt ?? 0
+            let outputs = self.audioSession.currentRoute.outputs
+                .map { "\($0.portType.rawValue):\($0.portName)" }
+                .joined(separator: ",")
+            self.report("[WIFI_AUDIO] ROUTE_CHANGE reason=\(rawReason) OUT=[\(outputs)] engineRunning=\(self.audioEngine.isRunning) voiceRunning=\(self.runningSnapshot())")
+        }
+    }
+
+    deinit {
+        if let routeChangeObserver {
+            NotificationCenter.default.removeObserver(routeChangeObserver)
+        }
     }
 
     // MARK: - Public API (kept compatible with AppModel.swift)
@@ -133,13 +153,11 @@ final class WiFiVoiceEngine: NSObject {
     // MARK: - Session / engine setup
 
     private func configureAudioSession() {
-        // Do not force the built-in speaker. With playAndRecord + voiceChat,
-        // let iOS/CallKit route selection choose receiver or speaker.
-        // Keep built-in routing neutral here; CallKit remains activation owner.
-        let options: AVAudioSession.CategoryOptions = []
-
+        // Let CallKit/system route controls select receiver or speaker.
+        // Do not force .defaultToSpeaker; allow Bluetooth HFP accessories.
+        // .allowBluetooth is supported by the project's Xcode 16.4 SDK.
         do {
-            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
+            try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: [.allowBluetooth])
             try audioSession.setPreferredSampleRate(Self.sampleRate)
             // Request a low-latency hardware I/O cycle. The wire packet remains 20 ms.
             try audioSession.setPreferredIOBufferDuration(0.01)
@@ -150,7 +168,27 @@ final class WiFiVoiceEngine: NSObject {
     }
 
     private func startEngine() -> Bool {
-        if runningSnapshot() { return true }
+        // CallKit/background interruptions may stop the real AVAudioEngine while
+        // our own flag remains true. Verify both engine and player state.
+        let stateFlag = runningSnapshot()
+        let engineRunning = audioEngine.isRunning
+        let playerRunning = playerNode.isPlaying
+        if stateFlag && engineRunning && playerRunning {
+            return true
+        }
+
+        if stateFlag || engineRunning || playerRunning {
+            report("[WIFI_AUDIO] RECOVERY stale state flag=\(stateFlag) engine=\(engineRunning) player=\(playerRunning); rebuilding audio graph")
+            stateLock.lock()
+            isRunning = false
+            stateLock.unlock()
+            audioEngine.inputNode.removeTap(onBus: 0)
+            playerNode.stop()
+            playerNode.reset()
+            audioEngine.stop()
+            micConverter = nil
+            micInputFormat = nil
+        }
 
         do {
             if !playbackConnected {
@@ -200,7 +238,11 @@ final class WiFiVoiceEngine: NSObject {
 
             playerNode.play()
             // Voice-open signaling is owned by BLE GATT in HYBRID R1.
+            let routeOutputs = audioSession.currentRoute.outputs
+                .map { "\($0.portType.rawValue):\($0.portName)" }
+                .joined(separator: ",")
             report("[WIFI_AUDIO] AEC_BYPASS_TEST OPEN OK capture=\(Int(captureFormat.sampleRate))Hz/\(captureFormat.channelCount)ch format=\(captureFormat.commonFormat.rawValue) -> monoFloat/48000 -> S16LE dual-mono 48k/2ch")
+            report("[WIFI_AUDIO] ACTIVE OUTPUT ROUTE=[\(routeOutputs)]")
             report("[WIFI_AUDIO] FRESH_R1 MIC TX path active; playback path unchanged; VPIO=off")
             return true
         } catch {
