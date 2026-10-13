@@ -38,12 +38,6 @@ final class AppModel: ObservableObject {
     @Published var missedCallNotifications: Bool {
         didSet { UserDefaults.standard.set(missedCallNotifications, forKey: "j7bridge.missedCallNotifications") }
     }
-    @Published var speakerDefault: Bool {
-        didSet {
-            UserDefaults.standard.set(speakerDefault, forKey: "j7bridge.speakerDefault")
-            wifiVoice.setSpeakerDefault(speakerDefault)
-        }
-    }
     @Published var simSlot: Int {
         didSet { UserDefaults.standard.set(simSlot, forKey: "j7bridge.simSlot") }
     }
@@ -71,7 +65,6 @@ final class AppModel: ObservableObject {
         autoConnect = UserDefaults.standard.object(forKey: "j7bridge.autoConnect") as? Bool ?? true
         resolveCallerNames = UserDefaults.standard.object(forKey: "j7bridge.resolveCallerNames") as? Bool ?? true
         missedCallNotifications = UserDefaults.standard.object(forKey: "j7bridge.missedCallNotifications") as? Bool ?? true
-        speakerDefault = UserDefaults.standard.object(forKey: "j7bridge.speakerDefault") as? Bool ?? true
         simSlot = UserDefaults.standard.object(forKey: "j7bridge.simSlot") as? Int ?? 0
         let rememberedHost = UserDefaults.standard.string(forKey: "j7bridge.j7Host") ?? "192.168.93.232"
         j7Host = rememberedHost
@@ -84,7 +77,6 @@ final class AppModel: ObservableObject {
         history = CallHistoryStore()
 
         ble.autoReconnect = autoConnect
-        wifiVoice.setSpeakerDefault(speakerDefault)
 
         ble.onLog = { [weak self] line in self?.log(line) }
         ble.onStatus = { [weak self] status in

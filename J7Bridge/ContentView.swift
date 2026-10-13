@@ -337,7 +337,6 @@ struct SettingsView: View {
                         Toggle("Auto-start Wi-Fi", isOn: $app.autoConnect)
                         Toggle("Resolve caller names", isOn: $app.resolveCallerNames)
                         Toggle("Missed-call notifications", isOn: $app.missedCallNotifications)
-                        Toggle("Speaker by default", isOn: $app.speakerDefault)
                     }
                     .padding()
                     .background(.thinMaterial)

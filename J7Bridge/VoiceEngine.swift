@@ -39,7 +39,6 @@ final class VoiceEngine: NSObject {
 
     private var isRunning = false
     private var converter: AVAudioConverter?
-    private var useSpeaker = true
     private var muted = false
     private var playbackConnected = false
 
@@ -61,13 +60,6 @@ final class VoiceEngine: NSObject {
             interleaved: false
         )!
     }()
-
-    func setSpeakerDefault(_ enabled: Bool) {
-        useSpeaker = enabled
-        if isRunning {
-            applySessionCategory()
-        }
-    }
 
     func setMuted(_ value: Bool) {
         muted = value
@@ -246,9 +238,13 @@ final class VoiceEngine: NSObject {
     }
 
     private func applySessionCategory() {
-        var options: AVAudioSession.CategoryOptions = [.allowBluetooth]
-        if useSpeaker {
-            options.insert(.defaultToSpeaker)
+        // Match the active Wi-Fi engine: keep standard iPhone/CallKit routing
+        // instead of forcing the built-in speaker as the default output.
+        let options: AVAudioSession.CategoryOptions
+        if #available(iOS 17.0, *) {
+            options = [.allowBluetoothHFP]
+        } else {
+            options = [.allowBluetooth]
         }
 
         try? audioSession.setCategory(

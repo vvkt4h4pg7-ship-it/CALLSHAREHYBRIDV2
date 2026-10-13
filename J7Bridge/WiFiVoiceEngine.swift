@@ -29,7 +29,6 @@ final class WiFiVoiceEngine: NSObject {
     private var isRunning = false
     private var muted = false
     private var playbackConnected = false
-    private var useSpeaker = true
 
     private var micConverter: AVAudioConverter?
     private var micInputFormat: AVAudioFormat?
@@ -75,13 +74,6 @@ final class WiFiVoiceEngine: NSObject {
     }
 
     // MARK: - Public API (kept compatible with AppModel.swift)
-
-    func setSpeakerDefault(_ enabled: Bool) {
-        useSpeaker = enabled
-        if runningSnapshot() {
-            configureAudioSession()
-        }
-    }
 
     func setMuted(_ value: Bool) {
         stateLock.lock()
@@ -141,8 +133,15 @@ final class WiFiVoiceEngine: NSObject {
     // MARK: - Session / engine setup
 
     private func configureAudioSession() {
-        var options: AVAudioSession.CategoryOptions = []
-        if useSpeaker { options.insert(.defaultToSpeaker) }
+        // Do not set .defaultToSpeaker: Apple documents that this option can
+        // ignore user route gestures. Let CallKit's native audio route control
+        // switch between the receiver, built-in speaker, and HFP accessories.
+        let options: AVAudioSession.CategoryOptions
+        if #available(iOS 17.0, *) {
+            options = [.allowBluetoothHFP]
+        } else {
+            options = [.allowBluetooth]
+        }
 
         do {
             try audioSession.setCategory(.playAndRecord, mode: .voiceChat, options: options)
